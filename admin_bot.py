@@ -7,7 +7,7 @@ from typing import Dict
 from telethon import Button, events
 from telethon.errors import MessageNotModifiedError
 
-from accounts import create_new_session, ensure_sessions_dir
+from accounts import ensure_sessions_dir
 from config import (
     ADMIN_IDS,
     GROUP_INTERVAL_MINUTES,
@@ -19,14 +19,6 @@ from scheduler import is_scheduler_running, start_scheduler, stop_scheduler
 
 PAGE_SIZE = 5
 ADMIN_STATE: Dict[int, Dict] = {}
-
-
-def _cancel_state(state: Dict):
-    state["cancelled"] = True
-    for key in ("code_future", "password_future"):
-        future = state.get(key)
-        if future and not future.done():
-            future.cancel()
 
 
 def setup_admin_handlers(bot):
@@ -438,30 +430,14 @@ def setup_admin_handlers(bot):
             return
         
         ensure_sessions_dir()
-        ADMIN_STATE[event.sender_id] = {"mode": "adding_account_phone"}
+        ADMIN_STATE[event.sender_id] = {"mode": "adding_account_wait_file"}
         
         text = (
             "➕ <b>Add New Account</b>\n\n"
-            "Send the phone number (with country code).\n"
-            "Example: <code>+989123456789</code>\n\n"
-            "You can cancel anytime."
+            "Send the session file (<code>.session</code>) for this account.\n"
+            "The filename will be used as the label."
         )
-        await event.edit(
-            text,
-            buttons=[[Button.inline("⬅️ Cancel", data=b"accounts:cancel")]],
-            parse_mode="html"
-        )
-
-    @bot.on(events.CallbackQuery(pattern=b"accounts:cancel"))
-    async def cb_accounts_cancel(event):
-        if event.sender_id not in ADMIN_IDS:
-            await event.answer("Access denied", alert=True)
-            return
-        state = ADMIN_STATE.pop(event.sender_id, None)
-        if state:
-            _cancel_state(state)
-        await event.answer("❌ عملیات لغو شد", alert=True)
-        await show_main_menu(event)
+        await event.edit(text, buttons=[[Button.inline("⬅️ Cancel", data=b"menu:accounts")]], parse_mode="html")
     
     @bot.on(events.CallbackQuery(pattern=b"menu:back"))
     async def cb_menu_back(event):
@@ -478,85 +454,48 @@ def setup_admin_handlers(bot):
         
         state = ADMIN_STATE.get(event.sender_id)
         text = (event.raw_text or "").strip()
-
-        if text.lower() in ("/cancel", "cancel") and state:
-            ADMIN_STATE.pop(event.sender_id, None)
-            _cancel_state(state)
-            await event.reply("❌ عملیات لغو شد")
-            return
         
-        # Adding account - waiting for phone number
-        if state and state.get("mode") == "adding_account_phone":
-            phone = text
-            if not phone.startswith("+") or len(phone) < 6:
-                await event.reply("❌ شماره نامعتبر است. مثال: +989123456789")
-                return
-
-            ADMIN_STATE[event.sender_id] = {
-                "mode": "adding_account_flow",
-                "phone": phone,
-            }
-
-            async def code_callback():
-                flow_state = ADMIN_STATE.get(event.sender_id)
-                if not flow_state or flow_state.get("cancelled"):
-                    raise asyncio.CancelledError()
-                await event.reply("✅ کد تایید را ارسال کنید یا /cancel")
-                flow_state["code_future"] = asyncio.get_running_loop().create_future()
-                flow_state["step"] = "awaiting_code"
-                return await flow_state["code_future"]
-
-            async def password_callback():
-                flow_state = ADMIN_STATE.get(event.sender_id)
-                if not flow_state or flow_state.get("cancelled"):
-                    raise asyncio.CancelledError()
-                await event.reply("🔐 رمز تایید دو مرحله‌ای را ارسال کنید یا /cancel")
-                flow_state["password_future"] = asyncio.get_running_loop().create_future()
-                flow_state["step"] = "awaiting_password"
-                return await flow_state["password_future"]
-
-            async def run_flow():
+        # Adding account - waiting for session file
+        if state and state.get("mode") == "adding_account_wait_file":
+            if event.document:
+                file_name = event.file.name or "session.session"
+                if not file_name.endswith(".session"):
+                    await event.reply("❌ File must be a .session file")
+                    return
+                
+                ensure_sessions_dir()
+                path = os.path.join(SESSIONS_DIR, file_name)
+                await event.download_media(file=path)
+                
+                label = os.path.splitext(file_name)[0]
+                phone = label.replace("session_", "+")
+                
                 from db import add_account
                 try:
-                    session_file = await create_new_session(
-                        phone=phone,
-                        code_callback=code_callback,
-                        password_callback=password_callback,
-                    )
-                    label = os.path.splitext(session_file)[0]
-                    await add_account(phone=phone, session_path=session_file, label=label)
-                    await event.reply(
-                        "✅ <b>Account added successfully</b>\n\n"
-                        f"Label: {label}\n"
-                        f"Session: {session_file}",
-                        parse_mode="html"
-                    )
+                    await add_account(phone=phone, session_path=file_name, label=label)
                 except sqlite3.IntegrityError:
-                    await event.reply("❌ این اکانت قبلا ثبت شده است.")
-                except asyncio.CancelledError:
-                    await event.reply("❌ عملیات لغو شد")
-                except Exception as exc:
-                    await event.reply(f"❌ خطا در ساخت سشن: {exc}")
-                finally:
-                    ADMIN_STATE.pop(event.sender_id, None)
-
-            asyncio.create_task(run_flow())
+                    if os.path.exists(path):
+                        os.remove(path)
+                    await event.reply(
+                        "❌ This account already exists. Session upload removed."
+                    )
+                    return
+                except Exception:
+                    if os.path.exists(path):
+                        os.remove(path)
+                    await event.reply("❌ Failed to add account. Please try again.")
+                    return
+                
+                ADMIN_STATE.pop(event.sender_id, None)
+                await event.reply(
+                    f"✅ <b>Account added successfully</b>\n\n"
+                    f"Label: {label}\n"
+                    f"Session: {file_name}",
+                    parse_mode="html"
+                )
+            else:
+                await event.reply("Please send a .session file")
             return
-
-        if state and state.get("mode") == "adding_account_flow":
-            step = state.get("step")
-            if step == "awaiting_code":
-                future = state.get("code_future")
-                if future and not future.done():
-                    future.set_result(text)
-                    await event.reply("⏳ در حال بررسی کد...")
-                return
-            if step == "awaiting_password":
-                future = state.get("password_future")
-                if future and not future.done():
-                    future.set_result(text)
-                    await event.reply("⏳ در حال تایید رمز...")
-                return
         
         # Setting proxy
         if state and state.get("mode") == "setting_proxy":
