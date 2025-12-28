@@ -1,13 +1,11 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from telethon import functions, types
-from telethon.errors import (
-    ChannelsTooMuchError,
-    FloodWaitError,
-    ChatWriteForbiddenError,
-    UserBannedInChannelError
-)
+
+from telethon import functions
+from telethon.errors import ChannelsTooMuchError, FloodWaitError
+
+from config import GROUP_INTERVAL_MINUTES, MAX_ACCOUNT_DAYS, MAX_GROUPS_PER_ACCOUNT, ADMIN_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +41,7 @@ async def run_scheduler(bot_client):
                 continue
             
             # Get active accounts
-            from db import get_accounts
+            from db import disable_account, get_accounts, log_error
             accounts = await get_accounts(active_only=True)
             now = datetime.utcnow()
             
@@ -88,11 +86,14 @@ async def run_scheduler(bot_client):
                         account_id,
                         "Exceeded Telegram limit for channels/groups"
                     )
-                    await bot_client.send_message(
-                        ADMIN_IDS[0],
-                        f"⚠️ Account {account_id} ({acc['phone']}) disabled\n"
-                        f"Reason: Too many channels/groups joined"
-                    )
+                    if ADMIN_IDS:
+                        await bot_client.send_message(
+                            ADMIN_IDS[0],
+                            f"⚠️ Account {account_id} ({acc['phone']}) disabled\n"
+                            f"Reason: Too many channels/groups joined"
+                        )
+                    else:
+                        logger.warning("No ADMIN_IDS configured to notify about disabled account.")
                 except FloodWaitError as e:
                     logger.warning(f"[Account {account_id}] FloodWait: {e.seconds}s")
                     await asyncio.sleep(e.seconds)
@@ -206,4 +207,3 @@ def generate_datetime_messages(dt: datetime) -> list:
         f"Unix: {unix_ts}",
         f"Summary: {summary}"
     ]
-

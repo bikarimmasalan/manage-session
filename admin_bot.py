@@ -1,6 +1,21 @@
+import asyncio
+import os
 import re
+import sqlite3
+from typing import Dict
+
 from telethon import Button, events
 from telethon.errors import MessageNotModifiedError
+
+from accounts import ensure_sessions_dir
+from config import (
+    ADMIN_IDS,
+    GROUP_INTERVAL_MINUTES,
+    MAX_ACCOUNT_DAYS,
+    MAX_GROUPS_PER_ACCOUNT,
+    SESSIONS_DIR,
+)
+from scheduler import is_scheduler_running, start_scheduler, stop_scheduler
 
 PAGE_SIZE = 5
 ADMIN_STATE: Dict[int, Dict] = {}
@@ -112,15 +127,7 @@ def setup_admin_handlers(bot):
         page = int(m.group(1))
         await show_accounts_page(event, page=page)
     
-    @bot.on(events.CallbackQuery(pattern=re.compile(br"account:view:(\d+)")))
-    async def cb_account_view(event):
-        if event.sender_id not in ADMIN_IDS:
-            await event.answer("Access denied", alert=True)
-            return
-        
-        m = re.match(br"account:view:(\d+)", event.data)
-        acc_id = int(m.group(1))
-        
+    async def show_account_details(event, acc_id: int):
         from db import get_account_by_id
         acc = await get_account_by_id(acc_id)
         
@@ -130,7 +137,9 @@ def setup_admin_handlers(bot):
         
         # Build info text
         status = "🟢 Active" if acc["is_active"] else "🔴 Inactive"
-        proxy_text = f"{acc['proxy_host']}:{acc['proxy_port']}" if acc.get("proxy_host") else "Not configured"
+        proxy_text = (
+            f"{acc['proxy_host']}:{acc['proxy_port']}" if acc.get("proxy_host") else "Not configured"
+        )
         groups = acc["created_groups_count"] or 0
         
         info = [
@@ -168,6 +177,16 @@ def setup_admin_handlers(bot):
         
         await event.edit("\n".join(info), buttons=buttons, parse_mode="html")
     
+    @bot.on(events.CallbackQuery(pattern=re.compile(br"account:view:(\d+)")))
+    async def cb_account_view(event):
+        if event.sender_id not in ADMIN_IDS:
+            await event.answer("Access denied", alert=True)
+            return
+        
+        m = re.match(br"account:view:(\d+)", event.data)
+        acc_id = int(m.group(1))
+        await show_account_details(event, acc_id)
+    
     @bot.on(events.CallbackQuery(pattern=re.compile(br"account:toggle:(\d+)")))
     async def cb_account_toggle(event):
         if event.sender_id not in ADMIN_IDS:
@@ -187,10 +206,7 @@ def setup_admin_handlers(bot):
         status = "enabled" if updated["is_active"] else "disabled"
         await event.answer(f"✅ Account {status}", alert=True)
         
-        # Refresh view
-        acc = await get_account_by_id(acc_id)
-        # ... (refresh logic same as account:view)
-        await cb_account_view(event)
+        await show_account_details(event, acc_id)
     
     @bot.on(events.CallbackQuery(pattern=re.compile(br"account:proxy:(\d+)")))
     async def cb_account_proxy(event):
@@ -228,7 +244,9 @@ def setup_admin_handlers(bot):
             await event.answer("Account not found", alert=True)
             return
         
-        session_path = os.path.join(SESSIONS_DIR, acc["session_path"])
+        session_path = acc["session_path"]
+        if not os.path.isabs(session_path):
+            session_path = os.path.join(SESSIONS_DIR, session_path)
         
         if os.path.exists(session_path):
             await event.reply(file=session_path, caption=f"📎 Session file for {acc['phone']}")
@@ -282,7 +300,9 @@ def setup_admin_handlers(bot):
         await disconnect_client(acc_id)
         
         # Delete session files
-        session_path = os.path.join(SESSIONS_DIR, acc["session_path"])
+        session_path = acc["session_path"]
+        if not os.path.isabs(session_path):
+            session_path = os.path.join(SESSIONS_DIR, session_path)
         for ext in ["", "-journal"]:
             file_path = session_path + ext
             if os.path.exists(file_path):
@@ -451,7 +471,20 @@ def setup_admin_handlers(bot):
                 phone = label.replace("session_", "+")
                 
                 from db import add_account
-                await add_account(phone=phone, session_path=file_name, label=label)
+                try:
+                    await add_account(phone=phone, session_path=file_name, label=label)
+                except sqlite3.IntegrityError:
+                    if os.path.exists(path):
+                        os.remove(path)
+                    await event.reply(
+                        "❌ This account already exists. Session upload removed."
+                    )
+                    return
+                except Exception:
+                    if os.path.exists(path):
+                        os.remove(path)
+                    await event.reply("❌ Failed to add account. Please try again.")
+                    return
                 
                 ADMIN_STATE.pop(event.sender_id, None)
                 await event.reply(
