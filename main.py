@@ -1,7 +1,10 @@
 
 import asyncio
 import logging
+
 from telethon import TelegramClient
+
+from config import ADMIN_IDS, API_HASH, API_ID, BOT_TOKEN
 
 logging.basicConfig(
     level=logging.INFO,

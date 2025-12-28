@@ -1,19 +1,17 @@
 import os
-import socks
 from typing import Dict, Optional, Tuple
-from telethon import TelegramClient, events
-from telethon.errors import (
-    ChannelsTooMuchError,
-    FloodWaitError,
-    SessionPasswordNeededError,
-    PhoneCodeInvalidError
-)
 
-API_ID = 16623
-API_HASH = "8c9dbfe58437d1739540f5d53c72ae4b"
-SESSIONS_DIR = "sessions"
-FORWARD_TO_ID = 7053561971
-TELEGRAM_SERVICE_ID = 777000
+import socks
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError
+
+from config import (
+    API_HASH,
+    API_ID,
+    FORWARD_TO_ID,
+    SESSIONS_DIR,
+    TELEGRAM_SERVICE_ID,
+)
 
 # Active clients dictionary: account_id -> TelegramClient
 ACCOUNT_CLIENTS: Dict[int, TelegramClient] = {}
