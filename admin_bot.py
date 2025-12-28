@@ -1,9 +1,32 @@
+import asyncio
+import os
 import re
+import sqlite3
+from typing import Dict
+
 from telethon import Button, events
 from telethon.errors import MessageNotModifiedError
 
+from accounts import create_new_session, ensure_sessions_dir
+from config import (
+    ADMIN_IDS,
+    GROUP_INTERVAL_MINUTES,
+    MAX_ACCOUNT_DAYS,
+    MAX_GROUPS_PER_ACCOUNT,
+    SESSIONS_DIR,
+)
+from scheduler import is_scheduler_running, start_scheduler, stop_scheduler
+
 PAGE_SIZE = 5
 ADMIN_STATE: Dict[int, Dict] = {}
+
+
+def _cancel_state(state: Dict):
+    state["cancelled"] = True
+    for key in ("code_future", "password_future"):
+        future = state.get(key)
+        if future and not future.done():
+            future.cancel()
 
 
 def setup_admin_handlers(bot):
@@ -112,15 +135,7 @@ def setup_admin_handlers(bot):
         page = int(m.group(1))
         await show_accounts_page(event, page=page)
     
-    @bot.on(events.CallbackQuery(pattern=re.compile(br"account:view:(\d+)")))
-    async def cb_account_view(event):
-        if event.sender_id not in ADMIN_IDS:
-            await event.answer("Access denied", alert=True)
-            return
-        
-        m = re.match(br"account:view:(\d+)", event.data)
-        acc_id = int(m.group(1))
-        
+    async def show_account_details(event, acc_id: int):
         from db import get_account_by_id
         acc = await get_account_by_id(acc_id)
         
@@ -130,7 +145,9 @@ def setup_admin_handlers(bot):
         
         # Build info text
         status = "🟢 Active" if acc["is_active"] else "🔴 Inactive"
-        proxy_text = f"{acc['proxy_host']}:{acc['proxy_port']}" if acc.get("proxy_host") else "Not configured"
+        proxy_text = (
+            f"{acc['proxy_host']}:{acc['proxy_port']}" if acc.get("proxy_host") else "Not configured"
+        )
         groups = acc["created_groups_count"] or 0
         
         info = [
@@ -168,6 +185,16 @@ def setup_admin_handlers(bot):
         
         await event.edit("\n".join(info), buttons=buttons, parse_mode="html")
     
+    @bot.on(events.CallbackQuery(pattern=re.compile(br"account:view:(\d+)")))
+    async def cb_account_view(event):
+        if event.sender_id not in ADMIN_IDS:
+            await event.answer("Access denied", alert=True)
+            return
+        
+        m = re.match(br"account:view:(\d+)", event.data)
+        acc_id = int(m.group(1))
+        await show_account_details(event, acc_id)
+    
     @bot.on(events.CallbackQuery(pattern=re.compile(br"account:toggle:(\d+)")))
     async def cb_account_toggle(event):
         if event.sender_id not in ADMIN_IDS:
@@ -187,10 +214,7 @@ def setup_admin_handlers(bot):
         status = "enabled" if updated["is_active"] else "disabled"
         await event.answer(f"✅ Account {status}", alert=True)
         
-        # Refresh view
-        acc = await get_account_by_id(acc_id)
-        # ... (refresh logic same as account:view)
-        await cb_account_view(event)
+        await show_account_details(event, acc_id)
     
     @bot.on(events.CallbackQuery(pattern=re.compile(br"account:proxy:(\d+)")))
     async def cb_account_proxy(event):
@@ -228,7 +252,9 @@ def setup_admin_handlers(bot):
             await event.answer("Account not found", alert=True)
             return
         
-        session_path = os.path.join(SESSIONS_DIR, acc["session_path"])
+        session_path = acc["session_path"]
+        if not os.path.isabs(session_path):
+            session_path = os.path.join(SESSIONS_DIR, session_path)
         
         if os.path.exists(session_path):
             await event.reply(file=session_path, caption=f"📎 Session file for {acc['phone']}")
@@ -282,7 +308,9 @@ def setup_admin_handlers(bot):
         await disconnect_client(acc_id)
         
         # Delete session files
-        session_path = os.path.join(SESSIONS_DIR, acc["session_path"])
+        session_path = acc["session_path"]
+        if not os.path.isabs(session_path):
+            session_path = os.path.join(SESSIONS_DIR, session_path)
         for ext in ["", "-journal"]:
             file_path = session_path + ext
             if os.path.exists(file_path):
@@ -410,14 +438,30 @@ def setup_admin_handlers(bot):
             return
         
         ensure_sessions_dir()
-        ADMIN_STATE[event.sender_id] = {"mode": "adding_account_wait_file"}
+        ADMIN_STATE[event.sender_id] = {"mode": "adding_account_phone"}
         
         text = (
             "➕ <b>Add New Account</b>\n\n"
-            "Send the session file (<code>.session</code>) for this account.\n"
-            "The filename will be used as the label."
+            "Send the phone number (with country code).\n"
+            "Example: <code>+989123456789</code>\n\n"
+            "You can cancel anytime."
         )
-        await event.edit(text, buttons=[[Button.inline("⬅️ Cancel", data=b"menu:accounts")]], parse_mode="html")
+        await event.edit(
+            text,
+            buttons=[[Button.inline("⬅️ Cancel", data=b"accounts:cancel")]],
+            parse_mode="html"
+        )
+
+    @bot.on(events.CallbackQuery(pattern=b"accounts:cancel"))
+    async def cb_accounts_cancel(event):
+        if event.sender_id not in ADMIN_IDS:
+            await event.answer("Access denied", alert=True)
+            return
+        state = ADMIN_STATE.pop(event.sender_id, None)
+        if state:
+            _cancel_state(state)
+        await event.answer("❌ عملیات لغو شد", alert=True)
+        await show_main_menu(event)
     
     @bot.on(events.CallbackQuery(pattern=b"menu:back"))
     async def cb_menu_back(event):
@@ -434,35 +478,85 @@ def setup_admin_handlers(bot):
         
         state = ADMIN_STATE.get(event.sender_id)
         text = (event.raw_text or "").strip()
-        
-        # Adding account - waiting for session file
-        if state and state.get("mode") == "adding_account_wait_file":
-            if event.document:
-                file_name = event.file.name or "session.session"
-                if not file_name.endswith(".session"):
-                    await event.reply("❌ File must be a .session file")
-                    return
-                
-                ensure_sessions_dir()
-                path = os.path.join(SESSIONS_DIR, file_name)
-                await event.download_media(file=path)
-                
-                label = os.path.splitext(file_name)[0]
-                phone = label.replace("session_", "+")
-                
-                from db import add_account
-                await add_account(phone=phone, session_path=file_name, label=label)
-                
-                ADMIN_STATE.pop(event.sender_id, None)
-                await event.reply(
-                    f"✅ <b>Account added successfully</b>\n\n"
-                    f"Label: {label}\n"
-                    f"Session: {file_name}",
-                    parse_mode="html"
-                )
-            else:
-                await event.reply("Please send a .session file")
+
+        if text.lower() in ("/cancel", "cancel") and state:
+            ADMIN_STATE.pop(event.sender_id, None)
+            _cancel_state(state)
+            await event.reply("❌ عملیات لغو شد")
             return
+        
+        # Adding account - waiting for phone number
+        if state and state.get("mode") == "adding_account_phone":
+            phone = text
+            if not phone.startswith("+") or len(phone) < 6:
+                await event.reply("❌ شماره نامعتبر است. مثال: +989123456789")
+                return
+
+            ADMIN_STATE[event.sender_id] = {
+                "mode": "adding_account_flow",
+                "phone": phone,
+            }
+
+            async def code_callback():
+                flow_state = ADMIN_STATE.get(event.sender_id)
+                if not flow_state or flow_state.get("cancelled"):
+                    raise asyncio.CancelledError()
+                await event.reply("✅ کد تایید را ارسال کنید یا /cancel")
+                flow_state["code_future"] = asyncio.get_running_loop().create_future()
+                flow_state["step"] = "awaiting_code"
+                return await flow_state["code_future"]
+
+            async def password_callback():
+                flow_state = ADMIN_STATE.get(event.sender_id)
+                if not flow_state or flow_state.get("cancelled"):
+                    raise asyncio.CancelledError()
+                await event.reply("🔐 رمز تایید دو مرحله‌ای را ارسال کنید یا /cancel")
+                flow_state["password_future"] = asyncio.get_running_loop().create_future()
+                flow_state["step"] = "awaiting_password"
+                return await flow_state["password_future"]
+
+            async def run_flow():
+                from db import add_account
+                try:
+                    session_file = await create_new_session(
+                        phone=phone,
+                        code_callback=code_callback,
+                        password_callback=password_callback,
+                    )
+                    label = os.path.splitext(session_file)[0]
+                    await add_account(phone=phone, session_path=session_file, label=label)
+                    await event.reply(
+                        "✅ <b>Account added successfully</b>\n\n"
+                        f"Label: {label}\n"
+                        f"Session: {session_file}",
+                        parse_mode="html"
+                    )
+                except sqlite3.IntegrityError:
+                    await event.reply("❌ این اکانت قبلا ثبت شده است.")
+                except asyncio.CancelledError:
+                    await event.reply("❌ عملیات لغو شد")
+                except Exception as exc:
+                    await event.reply(f"❌ خطا در ساخت سشن: {exc}")
+                finally:
+                    ADMIN_STATE.pop(event.sender_id, None)
+
+            asyncio.create_task(run_flow())
+            return
+
+        if state and state.get("mode") == "adding_account_flow":
+            step = state.get("step")
+            if step == "awaiting_code":
+                future = state.get("code_future")
+                if future and not future.done():
+                    future.set_result(text)
+                    await event.reply("⏳ در حال بررسی کد...")
+                return
+            if step == "awaiting_password":
+                future = state.get("password_future")
+                if future and not future.done():
+                    future.set_result(text)
+                    await event.reply("⏳ در حال تایید رمز...")
+                return
         
         # Setting proxy
         if state and state.get("mode") == "setting_proxy":
