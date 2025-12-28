@@ -2,7 +2,7 @@ import aiosqlite
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
-DB_PATH = "data.db"
+from config import DB_PATH
 
 
 async def init_db():
